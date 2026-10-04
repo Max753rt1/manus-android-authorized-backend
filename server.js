@@ -10,6 +10,7 @@ const port = Number(process.env.PORT || 10000);
 const pairingCode = process.env.PAIRING_CODE;
 const sessions = new Map();
 const devices = new Map();
+const sockets = new Map();
 const allowedActions = new Set(['open_app', 'get_status', 'request_screenshot', 'stop_session']);
 
 if (!pairingCode || pairingCode.length < 8) {
@@ -61,6 +62,7 @@ wss.on('connection', (ws, request) => {
   const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
   const session = sessions.get(token);
   if (!session || !session.active) { ws.close(1008, 'unauthorized'); return; }
+  sockets.set(session.sessionId, ws);
   ws.send(JSON.stringify({ type: 'session_ready', sessionId: session.sessionId, deviceId: session.deviceId }));
   ws.on('message', raw => {
     try {
@@ -69,7 +71,7 @@ wss.on('connection', (ws, request) => {
       if (message.type === 'heartbeat') ws.send(JSON.stringify({ type: 'heartbeat_ack', at: Date.now() }));
     } catch { ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); }
   });
-  ws.on('close', () => { session.active = false; sessions.set(token, session); });
+  ws.on('close', () => { sockets.delete(session.sessionId); session.active = false; sessions.set(token, session); });
 });
 
 app.post('/v1/sessions/:sessionId/commands', (req, res) => {
@@ -78,7 +80,11 @@ app.post('/v1/sessions/:sessionId/commands', (req, res) => {
   if (!allowedActions.has(action)) return json(res, 403, { error: 'action_not_allowed', allowedActions: [...allowedActions] });
   const session = [...sessions.values()].find(item => item.sessionId === req.params.sessionId && item.active);
   if (!session) return json(res, 404, { error: 'active_session_not_found' });
-  return json(res, 202, { accepted: true, commandId: crypto.randomUUID(), action, payload });
+  const ws = sockets.get(session.sessionId);
+  if (!ws || ws.readyState !== 1) return json(res, 409, { error: 'device_websocket_not_connected' });
+  const commandId = crypto.randomUUID();
+  ws.send(JSON.stringify({ type: 'command', commandId, action, payload }));
+  return json(res, 202, { accepted: true, commandId, action, payload });
 });
 
 server.listen(port, '0.0.0.0', () => console.log(`authorized backend listening on ${port}`));
