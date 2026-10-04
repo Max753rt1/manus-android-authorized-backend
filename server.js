@@ -11,7 +11,7 @@ const pairingCode = process.env.PAIRING_CODE;
 const sessions = new Map();
 const devices = new Map();
 const sockets = new Map();
-const allowedActions = new Set(['open_app', 'open_url', 'get_status', 'request_screenshot', 'stop_session']);
+const allowedActions = new Set(['open_app', 'open_url', 'tap', 'swipe', 'type_text', 'press_back', 'press_home', 'press_recents', 'get_status', 'request_screenshot', 'stop_session']);
 
 if (!pairingCode || pairingCode.length < 8) {
   console.error('PAIRING_CODE must be set and contain at least 8 characters');
