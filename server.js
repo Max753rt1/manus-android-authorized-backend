@@ -11,6 +11,7 @@ const pairingCode = process.env.PAIRING_CODE;
 const sessions = new Map();
 const devices = new Map();
 const sockets = new Map();
+const frames = new Map();
 const allowedActions = new Set(['open_app', 'open_url', 'tap', 'swipe', 'type_text', 'press_back', 'press_home', 'press_recents', 'get_status', 'request_screenshot', 'stop_session']);
 
 if (!pairingCode || pairingCode.length < 8) {
@@ -45,6 +46,23 @@ app.get('/v1/devices', (req, res) => {
   return json(res, 200, { devices: [...devices.values()].map(({ deviceId, deviceName, lastSeen, sessionId }) => ({ deviceId, deviceName, lastSeen, sessionId })) });
 });
 
+app.post('/v1/sessions/:sessionId/frame', express.raw({ type: ['image/jpeg', 'application/octet-stream'], limit: '2mb' }), (req, res) => {
+  const auth = req.header('authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const session = sessions.get(token);
+  if (!session || !session.active || session.sessionId !== req.params.sessionId) return json(res, 401, { error: 'unauthorized' });
+  if (!Buffer.isBuffer(req.body) || req.body.length < 100) return json(res, 400, { error: 'invalid_frame' });
+  frames.set(session.sessionId, { data: req.body, at: Date.now() });
+  return json(res, 202, { accepted: true, at: Date.now() });
+});
+
+app.get('/v1/sessions/:sessionId/frame', (req, res) => {
+  if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
+  const frame = frames.get(req.params.sessionId);
+  if (!frame || Date.now() - frame.at > 10000) return json(res, 404, { error: 'frame_not_available' });
+  res.set('Content-Type', 'image/jpeg').set('Cache-Control', 'no-store').send(frame.data);
+});
+
 app.post('/v1/sessions/:sessionId/stop', (req, res) => {
   if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
   let stopped = false;
@@ -71,7 +89,7 @@ wss.on('connection', (ws, request) => {
       if (message.type === 'heartbeat') ws.send(JSON.stringify({ type: 'heartbeat_ack', at: Date.now() }));
     } catch { ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); }
   });
-  ws.on('close', () => { sockets.delete(session.sessionId); session.active = false; sessions.set(token, session); });
+  ws.on('close', () => { sockets.delete(session.sessionId); frames.delete(session.sessionId); session.active = false; sessions.set(token, session); });
 });
 
 app.post('/v1/sessions/:sessionId/commands', (req, res) => {
