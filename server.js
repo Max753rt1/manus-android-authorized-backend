@@ -2,6 +2,7 @@ import express from 'express';
 import http from 'http';
 import crypto from 'crypto';
 import { WebSocketServer } from 'ws';
+import { planTask } from './agent.js';
 
 const app = express();
 const server = http.createServer(app);
@@ -12,6 +13,7 @@ const sessions = new Map();
 const devices = new Map();
 const sockets = new Map();
 const frames = new Map();
+const liveSignals = new Map();
 const allowedActions = new Set(['open_app', 'open_url', 'tap', 'swipe', 'type_text', 'press_back', 'press_home', 'press_recents', 'get_status', 'request_screenshot', 'stop_session']);
 
 if (!pairingCode || pairingCode.length < 8) {
@@ -64,6 +66,28 @@ app.get('/v1/sessions/:sessionId/frame', (req, res) => {
   res.set('Content-Type', 'image/jpeg').set('Cache-Control', 'no-store').send(frame.data);
 });
 
+app.post('/v1/sessions/:sessionId/live/signal', (req, res) => {
+  const session = [...sessions.values()].find(item => item.sessionId === req.params.sessionId && item.active);
+  const auth = req.header('authorization') || '';
+  const bearer = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const deviceAuthorized = session && sessions.get(bearer)?.sessionId === session.sessionId;
+  if (req.header('x-control-key') !== process.env.CONTROL_API_KEY && !deviceAuthorized) return json(res, 401, { error: 'unauthorized' });
+  if (!session) return json(res, 404, { error: 'active_session_not_found' });
+  const { type, data = {} } = req.body || {};
+  if (!['offer', 'answer', 'ice', 'state'].includes(type)) return json(res, 400, { error: 'invalid_signal_type' });
+  liveSignals.set(session.sessionId, { type, data, at: Date.now() });
+  const ws = sockets.get(session.sessionId);
+  if (ws?.readyState === 1 && type !== 'offer') ws.send(JSON.stringify({ type: 'live_signal', signal: { type, data } }));
+  return json(res, 202, { accepted: true, type });
+});
+
+app.get('/v1/sessions/:sessionId/live/signal', (req, res) => {
+  if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
+  const signal = liveSignals.get(req.params.sessionId);
+  if (!signal || Date.now() - signal.at > 30000) return json(res, 404, { error: 'signal_not_available' });
+  return json(res, 200, signal);
+});
+
 app.post('/v1/sessions/:sessionId/stop', (req, res) => {
   if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
   let stopped = false;
@@ -86,12 +110,12 @@ wss.on('connection', (ws, request) => {
   ws.on('message', raw => {
     try {
       const message = JSON.parse(raw.toString());
-      if (message.type !== 'result' && message.type !== 'heartbeat') { ws.send(JSON.stringify({ type: 'error', error: 'client_message_not_allowed' })); return; }
+      if (message.type !== 'result' && message.type !== 'batch_result' && message.type !== 'heartbeat') { ws.send(JSON.stringify({ type: 'error', error: 'client_message_not_allowed' })); return; }
       const device = devices.get(session.deviceId); if (device) { device.lastSeen = Date.now(); devices.set(session.deviceId, device); }
       if (message.type === 'heartbeat') ws.send(JSON.stringify({ type: 'heartbeat_ack', at: Date.now() }));
     } catch { ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); }
   });
-  ws.on('close', () => { sockets.delete(session.sessionId); frames.delete(session.sessionId); session.active = false; sessions.set(token, session); const device = devices.get(session.deviceId); if (device?.sessionId === session.sessionId) devices.delete(session.deviceId); });
+  ws.on('close', () => { sockets.delete(session.sessionId); frames.delete(session.sessionId); liveSignals.delete(session.sessionId); session.active = false; sessions.set(token, session); const device = devices.get(session.deviceId); if (device?.sessionId === session.sessionId) devices.delete(session.deviceId); });
 });
 
 app.post('/v1/sessions/:sessionId/commands', (req, res) => {
@@ -105,6 +129,27 @@ app.post('/v1/sessions/:sessionId/commands', (req, res) => {
   const commandId = crypto.randomUUID();
   ws.send(JSON.stringify({ type: 'command', commandId, action, payload }));
   return json(res, 202, { accepted: true, commandId, action, payload });
+});
+
+app.post('/v1/sessions/:sessionId/agent/plan', async (req, res) => {
+  if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
+  const session = [...sessions.values()].find(item => item.sessionId === req.params.sessionId && item.active);
+  if (!session) return json(res, 404, { error: 'active_session_not_found' });
+  try { return json(res, 200, await planTask(req.body || {})); } catch (error) { return json(res, 502, { ok: false, error: 'agent_unavailable' }); }
+});
+
+app.post('/v1/sessions/:sessionId/agent/execute', (req, res) => {
+  if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
+  const { taskId = crypto.randomUUID(), actions = [], confirmed = false } = req.body || {};
+  if (!Array.isArray(actions) || actions.length < 1 || actions.length > 3) return json(res, 400, { error: 'invalid_action_batch' });
+  const sensitive = actions.some(item => item.action === 'type_text');
+  if (sensitive && confirmed !== true) return json(res, 409, { error: 'confirmation_required', taskId, actions });
+  const session = [...sessions.values()].find(item => item.sessionId === req.params.sessionId && item.active);
+  const ws = session && sockets.get(session.sessionId);
+  if (!session || !ws || ws.readyState !== 1) return json(res, 409, { error: 'device_websocket_not_connected' });
+  const batchId = crypto.randomUUID();
+  ws.send(JSON.stringify({ type: 'action_batch', taskId, batchId, actions, requireFrameAfter: true }));
+  return json(res, 202, { accepted: true, taskId, batchId });
 });
 
 server.listen(port, '0.0.0.0', () => console.log(`authorized backend listening on ${port}`));
