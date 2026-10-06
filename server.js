@@ -43,7 +43,8 @@ app.post('/v1/pair', (req, res) => {
 
 app.get('/v1/devices', (req, res) => {
   if (req.header('x-control-key') !== process.env.CONTROL_API_KEY) return json(res, 401, { error: 'unauthorized' });
-  return json(res, 200, { devices: [...devices.values()].map(({ deviceId, deviceName, lastSeen, sessionId }) => ({ deviceId, deviceName, lastSeen, sessionId })) });
+  const active = new Set([...sessions.values()].filter(item => item.active).map(item => item.sessionId));
+  return json(res, 200, { devices: [...devices.values()].filter(item => active.has(item.sessionId)).map(({ deviceId, deviceName, lastSeen, sessionId }) => ({ deviceId, deviceName, lastSeen, sessionId })) });
 });
 
 app.post('/v1/sessions/:sessionId/frame', express.raw({ type: ['image/jpeg', 'application/octet-stream'], limit: '2mb' }), (req, res) => {
@@ -86,10 +87,11 @@ wss.on('connection', (ws, request) => {
     try {
       const message = JSON.parse(raw.toString());
       if (message.type !== 'result' && message.type !== 'heartbeat') { ws.send(JSON.stringify({ type: 'error', error: 'client_message_not_allowed' })); return; }
+      const device = devices.get(session.deviceId); if (device) { device.lastSeen = Date.now(); devices.set(session.deviceId, device); }
       if (message.type === 'heartbeat') ws.send(JSON.stringify({ type: 'heartbeat_ack', at: Date.now() }));
     } catch { ws.send(JSON.stringify({ type: 'error', error: 'invalid_json' })); }
   });
-  ws.on('close', () => { sockets.delete(session.sessionId); frames.delete(session.sessionId); session.active = false; sessions.set(token, session); });
+  ws.on('close', () => { sockets.delete(session.sessionId); frames.delete(session.sessionId); session.active = false; sessions.set(token, session); const device = devices.get(session.deviceId); if (device?.sessionId === session.sessionId) devices.delete(session.deviceId); });
 });
 
 app.post('/v1/sessions/:sessionId/commands', (req, res) => {
